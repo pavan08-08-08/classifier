@@ -210,6 +210,16 @@ def config():
     })
 
 
+@app.get("/debug")
+def debug():
+    try:
+        lines = open(LOG).read().strip().split("\n")
+        last = json.loads(lines[-1])["body"]
+        return jsonify({"policy": last.get("policy"), "sampleCases": (last.get("cases") or [])[:24], "n": len(lines)})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
 @app.post("/classify")
 def run():
     body = request.get_json(force=True, silent=True) or {}
