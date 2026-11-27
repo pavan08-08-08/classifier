@@ -287,6 +287,42 @@ def debug():
         return jsonify({"error": str(e)})
 
 
+@app.get("/summary")
+def summary():
+    """Compact view of all distinct cases from the latest logged requests, grouped by scenario."""
+    try:
+        lines = open(LOG).read().strip().split("\n")[-4:]
+        seen, groups = set(), {}
+        for ln in lines:
+            for c in json.loads(ln)["body"].get("cases") or []:
+                if c.get("caseId") in seen:
+                    continue
+                seen.add(c.get("caseId"))
+                users = " || ".join(user_msgs(c))
+                tl = c.get("proposedTool") or {}
+                res = tl.get("resolved") or {}
+                env = c.get("environment") or {}
+                iso = env.get("isolation") or {}
+                extra = {k: v for k, v in res.items() if k not in ("target", "source")}
+                ut = [str(r.get("content"))[:70] for r in (c.get("toolResults") or []) if r.get("origin") == "untrusted"]
+                pf = [r for r in (c.get("toolResults") or []) if r.get("tool") == "preflight"]
+                line = ("USER: %s | ENV: %s verified=%s mounts=%s creds=%s net=%s | TOOL: %s %s | RES: %s | UNTRUSTED: %s | PREFLIGHT: %s | ROLLBACK: %s | MEM: %s | REPO: %s"
+                        % (users, env.get("kind"), iso.get("verified"), len(iso.get("hostMounts") or []), iso.get("credentials"), iso.get("externalNetwork"),
+                           tl.get("name"), dump(tl.get("arguments"))[:110], dump(extra), ut, dump(pf)[:90], dump(c.get("rollbackPlan"))[:90],
+                           [m.get("text") for m in c.get("memory") or [] if m.get("origin") != "saved-preference"],
+                           [r.get("text") for r in c.get("repositoryInstructions") or [] if "formatter" not in str(r.get("text"))]))
+                norm = re.sub(r"-[0-9a-f]{4,6}\b", "-X", line)
+                norm = re.sub(r"archive-[0-9a-f]+", "archive-X", norm)
+                key = norm
+                mine = "/".join(classify(c))
+                g = groups.setdefault(key, {"n": 0, "mine": mine, "id": c.get("caseId")})
+                g["n"] += 1
+        out = ["%d x  MINE=%s\n   %s" % (g["n"], g["mine"], k) for k, g in groups.items()]
+        return app.response_class("\n\n".join(out), mimetype="text/plain")
+    except Exception as e:
+        return str(e)
+
+
 @app.post("/classify")
 def run():
     body = request.get_json(force=True, silent=True) or {}
