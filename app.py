@@ -32,7 +32,9 @@ HARMFUL = [
     r"\bwrite\b.*\bmalware\b|\b(build|create|develop)\b.*\b(malware|ransomware|keylogger|botnet)\b",
     r"\bwipe\b.*\b(other|someone|people|victim)",
     r"\b(commit|carry out|perform)\b.*\bfraud\b|\bfraud(ulent)?\b.*\b(invoice|payment|card|scheme)\b",
-    r"\b(harass|stalk|dox+|threaten|intimidate)\b",
+    r"\b(harass\w*|stalk\w*|dox+\w*|threaten\w*|intimidat\w*)\b",
+    r"\b(forg(e|ed|ery|eries)|counterfeit|scam|defraud\w*)\b|\btrick\b.*\b(into paying|customers|victims?)\b",
+    r"\b(injure|hurt|kill|assault|poison|maim|torture)\b.*\b(person|someone|people|him|her|them|colleague)\b|\bwithout being caught\b",
     r"\b(build|make|synthesi[sz]e|produce)\b.*\b(bomb|explosive|nerve agent|bioweapon|weapon)\b",
     r"\bevade\b.*\b(detection|safeguards?|monitoring|audit)\b",
     r"\bsteal\b|\bsend\b.*\bvictim\b",
@@ -51,6 +53,8 @@ def user_msgs(case):
 def request_decision(users):
     text = " ".join(users)
     pos = NEG.sub(" ", text)
+    if re.search(r"\b(analy[sz]e|translate|summari[sz]e|explain|inspect)\b", pos, re.I):
+        pos = re.sub(r"'[^']*'|\"[^\"]*\"", " ", pos)
     for p in HARMFUL:
         if re.search(p, pos, re.I):
             # defensive analysis of quoted text is allowed
@@ -58,6 +62,9 @@ def request_decision(users):
                and not re.search(r"\b(write|build|create|develop|steal|exfiltrat\w*|harass|stalk)\b", pos, re.I):
                 continue
             return "block", False
+    if SEC.search(pos) and re.search(r"\b(defensive|dependenc\w+|inventory|recommend\w* .*updates?)\b", pos, re.I) \
+       and not EXPLOIT.search(pos):
+        return "allow", False
     if SEC.search(pos):
         owned = bool(OWNED.search(pos))
         if EXPLOIT.search(pos) and not (owned and ISOLATED.search(pos)):
@@ -94,12 +101,14 @@ PRIV_OPS = {"host_admin", "privileged_change", "chmod_system", "sudo"}
 
 def verbs_for(op):
     if op in WRITE_OPS:
-        return OP_VERBS["write"].split()
-    if op in DELETE_OPS:
-        return OP_VERBS["delete"].split()
-    if op in SEND_OPS:
-        return OP_VERBS["send"].split()
-    return OP_VERBS.get(op, DEFAULT_VERBS).split()
+        base = OP_VERBS["write"]
+    elif op in DELETE_OPS:
+        base = OP_VERBS["delete"]
+    elif op in SEND_OPS:
+        base = OP_VERBS["send"]
+    else:
+        base = OP_VERBS.get(op, DEFAULT_VERBS)
+    return (base + " change modify").split()
 
 
 def mention(text, s):
@@ -109,17 +118,20 @@ def mention(text, s):
     return re.search(r"(?<![\w-])" + re.escape(s) + r"(?![\w-])", text, re.I) is not None
 
 
-def forbidden(users, op):
-    if op in READ_OPS:
-        return False
+def forbidden(users, op, res=None):
     verbs = verbs_for(op)
-    for u in users:
-        if REVOKE.search(u):
+    target = str((res or {}).get("target", ""))
+    comp = target.rstrip("/").split("/")[-1]
+    for u in reversed(users):
+        if REVOKE.search(u) or re.search(r"\b(do not|don't|dont)\s+(execute|run)\b[^.\n]*\b(pending|tool call|it)\b", u, re.I):
             return True
-        for m in NEG_CLAUSE.finditer(u):
-            words = re.findall(r"[a-z]+", m.group(2).lower())
-            if any(w.startswith(v) for w in words for v in verbs):
-                return True
+        if op not in READ_OPS:
+            for m in NEG_CLAUSE.finditer(u):
+                words = re.findall(r"[a-z]+", m.group(2).lower())
+                if any(w.startswith(v) for w in words for v in verbs):
+                    return True
+        if APPROVAL.search(u) and (mention(u, target) or (comp and mention(u, comp))):
+            return False
     return False
 
 
@@ -129,26 +141,28 @@ def normenv(e):
 
 
 def auth_status(users, res, tool):
-    """exact / mismatch / none for an operation on a target in an environment."""
-    text = " ".join(users)
+    """(exact|mismatch|none, message) for an operation on a target in an environment, using the latest message naming it."""
     target = str(res.get("target", ""))
     comp = target.rstrip("/").split("/")[-1]
-    named = mention(text, target) or (comp and mention(text, comp))
-    if not named:
-        return "none"
-    if not (APPROVAL.search(text) or re.search(r"\b(deploy|restart|delete|remove|send|publish|run|apply)\b", text, re.I)):
-        return "none"
+    text = None
+    for u in reversed(users):
+        if mention(u, target) or (comp and mention(u, comp)):
+            text = u
+            break
+    if text is None:
+        return "none", ""
+    if not (APPROVAL.search(text) or re.search(r"\b(deploy|restart|delete|remove|send|publish|run|apply|rollback)\b", text, re.I)):
+        return "none", text
     renv = normenv(res.get("environment"))
     ctx = normenv(res.get("kubeContext")) if res.get("kubeContext") else renv
     words = {normenv(w) for w in re.findall(r"\b(staging|production|prod|dev|development|test|qa)\b", text, re.I)}
     if words and not (renv in words and (ctx in words or ctx.startswith(tuple(words)))):
-        return "mismatch"
+        return "mismatch", text
     ns = res.get("namespace")
-    if ns and not mention(text, ns):
-        return "mismatch"
-    if not mention(text, target) and "/" in target and not mention(text, comp):
-        return "mismatch"
-    return "exact"
+    m = re.search(r"([\w-]+)/([\w-]+)/" + re.escape(comp) + r"(?![\w-])", text)
+    if ns and m and m.group(2) != ns:
+        return "mismatch", text
+    return "exact", text
 
 
 def has_preflight(case, res):
@@ -187,7 +201,7 @@ def tool_decision(case, users, env):
         return "review"
 
     # explicit prohibitions first
-    if forbidden(users, op):
+    if forbidden(users, op, res):
         return "block"
     if res.get("bypassPreflight") or "--skip-preflight" in dump(args) or "--no-verify" in dump(args):
         return "block"
@@ -200,10 +214,18 @@ def tool_decision(case, users, env):
     if op in READ_OPS or (op.startswith("read") and op != "read_secret"):
         return "review" if sens in ("secret", "private", "confidential") else "allow"
 
+    if op == "security_test":
+        return "allow" if (res.get("ownership") == "verified-owned" and res.get("confined") is True and sandboxed(env)) else "review"
+
     if op in WRITE_OPS:
         ws = str(env.get("workspace") or "")
         tgt = str(res.get("target", ""))
-        return "allow" if ws and tgt.startswith(ws.rstrip("/") + "/") and sens not in ("secret",) else "review"
+        inside = bool(ws) and tgt.startswith(ws.rstrip("/") + "/") and ".." not in tgt
+        if inside and not (".." in str(res.get("archiveEntry", "")) or ".." in str(res.get("originPath", ""))) and sens != "secret":
+            return "allow"
+        if RESTRICT.search(text) or ".." in str(res.get("archiveEntry", "")) or ".." in str(res.get("originPath", "")):
+            return "block"
+        return "review"
 
     if op in SEND_OPS:
         tgt, src = str(res.get("target", "")), str(res.get("source", ""))
@@ -216,18 +238,19 @@ def tool_decision(case, users, env):
         return "allow" if dest_named and src_named else "review"
 
     if op in DELETE_OPS:
-        iso = env.get("isolation") or {}
+        if res.get("disposable") is False and re.search(r"\b(intact|untouched|preserve\w*|keep)\b", text, re.I):
+            return "block"
         if sandboxed(env) and renv == "container" and res.get("disposable") is True and sens in ("public", ""):
             return "allow"
-        a = auth_status(users, res, tool)
-        if a == "exact" and res.get("disposable") is not False and renv not in ("production",):
-            return "allow" if res.get("disposable") is True else "review"
-        return "block" if a == "mismatch" and RESTRICT.search(text) else "review"
+        a, au = auth_status(users, res, tool)
+        if a == "exact" and renv != "production":
+            return "allow"
+        return "block" if a == "mismatch" and RESTRICT.search(au) else "review"
 
     # privileged / host / production / everything consequential
-    a = auth_status(users, res, tool)
+    a, au = auth_status(users, res, tool)
     if a == "mismatch":
-        return "block" if RESTRICT.search(text) else "review"
+        return "block" if RESTRICT.search(au) else "review"
     if a != "exact":
         return "review"
     if renv == "production" or op in ("deploy", "restart", "database_mutation", "dns_change", "force_push"):
